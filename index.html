@@ -141,6 +141,7 @@
     // Configuration constants
     const INITIAL_RETRY_DELAY = 1000; // milliseconds
     const MAX_RETRY_DELAY = 8000; // milliseconds
+    const MAX_RETRIES = 3; // maximum retry attempts per request
     const MIN_STEP_SIZE = 1000; // blocks
     const STEP_REDUCTION_THRESHOLD = 2; // retry attempts before reducing step
     const RATE_LIMIT_BATCH_SIZE = 10; // calls before delay
@@ -218,14 +219,13 @@
       
       const startTime = Date.now();
       let retriesCount = 0;
-      const maxRetries = 3;
       
       for (let from = start; from <= latest; from += step){
         const to = Math.min(from + step - 1, latest);
         let retries = 0;
         let success = false;
         
-        while (!success && retries < maxRetries){
+        while (!success && retries < MAX_RETRIES){
           try {
             appendLog(`fetching ${from}→${to}${retries > 0 ? ` (retry ${retries})` : ''}`);
             const chunk = await provider.getLogs({ fromBlock: from, toBlock: to, address: contractAddress, topics });
@@ -243,9 +243,9 @@
           } catch (err){
             retries++;
             retriesCount++;
-            appendLog(`log error ${from}-${to}: ${err.message || err}${retries < maxRetries ? ', retrying...' : ''}`);
+            appendLog(`log error ${from}-${to}: ${err.message || err}${retries < MAX_RETRIES ? ', retrying...' : ''}`);
             
-            if (retries < maxRetries){
+            if (retries < MAX_RETRIES){
               // Exponential backoff
               const waitTime = Math.min(INITIAL_RETRY_DELAY * Math.pow(2, retries - 1), MAX_RETRY_DELAY);
               await new Promise(r=>setTimeout(r, waitTime));
@@ -256,7 +256,7 @@
                 appendLog(`reducing step size to ${step}`);
               }
             } else {
-              appendLog(`failed after ${maxRetries} retries, skipping range ${from}-${to}`);
+              appendLog(`failed after ${MAX_RETRIES} retries, skipping range ${from}-${to}`);
               success = true; // Move on to avoid infinite loop
             }
           }
@@ -619,7 +619,7 @@
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         const tokenId = $('tokenId').value.toString().replace(/[^\d]/g,'') || 'token';
-        const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5); // YYYY-MM-DDTHH-MM-SS
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19); // YYYY-MM-DDTHH-MM-SS
         a.href = url;
         a.download = `holders_token_${tokenId}_${timestamp}.csv`;
         document.body.appendChild(a);
@@ -645,11 +645,10 @@
         
         appendLog('attempting to detect contract deployment block...');
         const latest = await provider.getBlockNumber();
-        const currentBlock = latest;
         
         // Binary search for first non-zero logs presence for address
-        let low = Math.max(0, currentBlock - MAX_BLOCK_SEARCH_RANGE);
-        let high = currentBlock;
+        let low = Math.max(0, latest - MAX_BLOCK_SEARCH_RANGE);
+        let high = latest;
         let foundBlock = null;
         
         for (let i=0; i<6; i++){
