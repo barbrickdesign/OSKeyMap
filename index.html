@@ -138,6 +138,16 @@
     let reconHolders = []; // {address, balance}
     let isScanning = false; // Prevent concurrent scans
 
+    // Configuration constants
+    const INITIAL_RETRY_DELAY = 1000; // milliseconds
+    const MAX_RETRY_DELAY = 8000; // milliseconds
+    const MIN_STEP_SIZE = 1000; // blocks
+    const STEP_REDUCTION_THRESHOLD = 2; // retry attempts before reducing step
+    const RATE_LIMIT_BATCH_SIZE = 10; // calls before delay
+    const RATE_LIMIT_DELAY = 100; // milliseconds
+    const DISPLAY_LIMIT = 2000; // max holders to display in table
+    const MAX_BLOCK_SEARCH_RANGE = 8000000; // blocks to search for contract deployment
+
     /**
      * Appends a timestamped message to the log display
      * @param {string} msg - The message to log
@@ -189,6 +199,7 @@
 
     /**
      * Queries blockchain logs in chunks with automatic retry and adaptive step sizing
+     * @async
      * @param {ethers.Provider} provider - The RPC provider
      * @param {string} contractAddress - Contract address to query
      * @param {Array<string>} topics - Event topics to filter
@@ -235,12 +246,12 @@
             
             if (retries < maxRetries){
               // Exponential backoff
-              const waitTime = Math.min(1000 * Math.pow(2, retries - 1), 8000);
+              const waitTime = Math.min(INITIAL_RETRY_DELAY * Math.pow(2, retries - 1), MAX_RETRY_DELAY);
               await new Promise(r=>setTimeout(r, waitTime));
               
               // Reduce step size on repeated failures
-              if (retries === 2 && step > 1000) {
-                step = Math.max(1000, Math.floor(step/2));
+              if (retries === STEP_REDUCTION_THRESHOLD && step > MIN_STEP_SIZE) {
+                step = Math.max(MIN_STEP_SIZE, Math.floor(step/2));
                 appendLog(`reducing step size to ${step}`);
               }
             } else {
@@ -348,6 +359,7 @@
 
     /**
      * Verifies reconstructed balances against on-chain state
+     * @async
      * @param {ethers.Provider} provider - The RPC provider
      * @param {string} contractAddress - Contract address
      * @param {ethers.Interface} iface - Contract interface
@@ -370,9 +382,9 @@
           const bal = BigInt(decoded.toString());
           if (bal > 0n) out.push({ address: c.address, balance: bal.toString() });
           
-          // Small delay every 10 calls to avoid rate limiting
-          if (i > 0 && i % 10 === 0){
-            await new Promise(r=>setTimeout(r, 100));
+          // Small delay every N calls to avoid rate limiting
+          if (i > 0 && i % RATE_LIMIT_BATCH_SIZE === 0){
+            await new Promise(r=>setTimeout(r, RATE_LIMIT_DELAY));
             
             // Update ETA
             const elapsed = Date.now() - startTime;
@@ -514,8 +526,7 @@
       // Because parseLog returns same shape for both TransferSingle and TransferBatch we can reuse
       const holders = processEventsToBalances(allLogs, iface, tokenId);
       tableBody.innerHTML = '';
-      const displayLimit = 2000;
-      const displayHolders = holders.slice(0, displayLimit);
+      const displayHolders = holders.slice(0, DISPLAY_LIMIT);
       
       for (const h of displayHolders){
         const tr = document.createElement('tr');
@@ -527,8 +538,8 @@
       
       countEl.textContent = holders.length.toString();
       
-      if (holders.length > displayLimit){
-        appendLog(`displaying first ${displayLimit} of ${holders.length} holders`);
+      if (holders.length > DISPLAY_LIMIT){
+        appendLog(`displaying first ${DISPLAY_LIMIT} of ${holders.length} holders`);
       }
       
       return holders;
@@ -636,7 +647,7 @@
         const now = latest;
         
         // Binary search for first non-zero logs presence for address
-        let low = Math.max(0, now - 8000000);
+        let low = Math.max(0, now - MAX_BLOCK_SEARCH_RANGE);
         let high = now;
         let foundBlock = null;
         
