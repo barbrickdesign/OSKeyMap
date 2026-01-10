@@ -145,6 +145,7 @@
     const STEP_REDUCTION_THRESHOLD = 2; // retry attempts before reducing step
     const RATE_LIMIT_BATCH_SIZE = 10; // calls before delay
     const RATE_LIMIT_DELAY = 100; // milliseconds
+    const ADDITIONAL_RATE_LIMIT_DELAY = 200; // milliseconds for additional throttling
     const DISPLAY_LIMIT = 2000; // max holders to display in table
     const MAX_BLOCK_SEARCH_RANGE = 8000000; // blocks to search for contract deployment
 
@@ -262,7 +263,7 @@
         }
         
         // Small delay to avoid rate limiting
-        if (retriesCount > 2) await new Promise(r=>setTimeout(r, 200));
+        if (retriesCount > 2) await new Promise(r=>setTimeout(r, ADDITIONAL_RATE_LIMIT_DELAY));
       }
       setProgress(70);
       etaEl.textContent = '';
@@ -618,7 +619,7 @@
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         const tokenId = $('tokenId').value.toString().replace(/[^\d]/g,'') || 'token';
-        const timestamp = new Date().toISOString().slice(0,10);
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5); // YYYY-MM-DDTHH-MM-SS
         a.href = url;
         a.download = `holders_token_${tokenId}_${timestamp}.csv`;
         document.body.appendChild(a);
@@ -644,11 +645,11 @@
         
         appendLog('attempting to detect contract deployment block...');
         const latest = await provider.getBlockNumber();
-        const now = latest;
+        const currentBlock = latest;
         
         // Binary search for first non-zero logs presence for address
-        let low = Math.max(0, now - MAX_BLOCK_SEARCH_RANGE);
-        let high = now;
+        let low = Math.max(0, currentBlock - MAX_BLOCK_SEARCH_RANGE);
+        let high = currentBlock;
         let foundBlock = null;
         
         for (let i=0; i<6; i++){
