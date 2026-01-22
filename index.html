@@ -136,61 +136,182 @@
     const tableBody = $('tableBody'), countEl = $('count'), contractDisplay = $('contractDisplay'), tableFooter = $('tableFooter');
 
     let reconHolders = []; // {address, balance}
+    let isScanning = false; // Prevent concurrent scans
+
+    // Configuration constants
+    const INITIAL_RETRY_DELAY = 1000; // milliseconds
+    const MAX_RETRY_DELAY = 8000; // milliseconds
+    const MAX_RETRIES = 3; // maximum retry attempts per request
+    const MIN_STEP_SIZE = 1000; // blocks
+    const STEP_REDUCTION_THRESHOLD = 2; // retry attempts before reducing step
+    const RATE_LIMIT_BATCH_SIZE = 10; // calls before delay
+    const RATE_LIMIT_DELAY = 100; // milliseconds
+    const ADDITIONAL_RATE_LIMIT_DELAY = 200; // milliseconds for additional throttling
+    const DISPLAY_LIMIT = 2000; // max holders to display in table
+    const MAX_BLOCK_SEARCH_RANGE = 8000000; // blocks to search for contract deployment
+
+    /**
+     * Appends a timestamped message to the log display
+     * @param {string} msg - The message to log
+     */
     function appendLog(msg){
       const now = new Date().toISOString().slice(11,23);
       logEl.textContent = `${now}  ${msg}\n` + logEl.textContent;
     }
+
+    /**
+     * Updates the progress bar percentage
+     * @param {number} p - Progress percentage (0-100)
+     */
     function setProgress(p){ bar.style.width = Math.max(0, Math.min(100,p)) + '%'; }
+
+    /**
+     * Converts holder data to CSV format
+     * @param {Array<{address: string, balance: string}>} rows - Holder data
+     * @returns {string} CSV formatted string
+     */
     function toCSV(rows){
       const header = ['address','balance'];
       const lines = [header.join(',')].concat(rows.map(r => `${r.address},${r.balance}`));
       return lines.join('\n');
     }
 
+    /**
+     * Validates Ethereum address format
+     * @param {string} address - Address to validate
+     * @returns {boolean} True if valid
+     */
+    function isValidAddress(address){
+      return /^0x[a-fA-F0-9]{40}$/.test(address);
+    }
+
+    /**
+     * Validates RPC URL format
+     * @param {string} url - URL to validate
+     * @returns {boolean} True if valid
+     */
+    function isValidRpcUrl(url){
+      try {
+        const parsed = new URL(url);
+        return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+      } catch {
+        return false;
+      }
+    }
+
+    /**
+     * Queries blockchain logs in chunks with automatic retry and adaptive step sizing
+     * @async
+     * @param {ethers.Provider} provider - The RPC provider
+     * @param {string} contractAddress - Contract address to query
+     * @param {Array<string>} topics - Event topics to filter
+     * @param {number} fromBlock - Starting block number
+     * @param {number} toBlock - Ending block number (optional)
+     * @param {number} step - Initial chunk size (default 5000)
+     * @returns {Promise<Array>} Array of log objects
+     */
     async function queryLogs(provider, contractAddress, topics, fromBlock, toBlock, step=5000){
       const logs = [];
       const latest = toBlock ?? await provider.getBlockNumber();
       let start = fromBlock;
       if (!start) start = 0;
       appendLog(`queryLogs: scanning ${start} → ${latest} in steps of ${step}`);
+      
+      const startTime = Date.now();
+      let retriesCount = 0;
+      
       for (let from = start; from <= latest; from += step){
         const to = Math.min(from + step - 1, latest);
-        try {
-          appendLog(`fetching ${from}→${to}`);
-          const chunk = await provider.getLogs({ fromBlock: from, toBlock: to, address: contractAddress, topics });
-          logs.push(...chunk);
-          setProgress( Math.round( (to / latest) * 60 ) );
-        } catch (err){
-          appendLog(`log error ${from}-${to} ${err.message || err}`);
-          // backoff small wait
-          await new Promise(r=>setTimeout(r, 800));
-          // try smaller step on failure
-          if (step > 1000) step = Math.max(1000, Math.floor(step/2));
-          from -= step; // retry this range
+        let retries = 0;
+        let success = false;
+        
+        while (!success && retries < MAX_RETRIES){
+          try {
+            appendLog(`fetching ${from}→${to}${retries > 0 ? ` (retry ${retries})` : ''}`);
+            const chunk = await provider.getLogs({ fromBlock: from, toBlock: to, address: contractAddress, topics });
+            logs.push(...chunk);
+            setProgress( Math.round( (to / latest) * 60 ) );
+            
+            // Update ETA
+            const elapsed = Date.now() - startTime;
+            const progress = (to - start) / (latest - start);
+            if (progress > 0.01){
+              const eta = Math.round((elapsed / progress - elapsed) / 1000);
+              etaEl.textContent = `ETA: ${eta}s`;
+            }
+            success = true;
+          } catch (err){
+            retries++;
+            retriesCount++;
+            appendLog(`log error ${from}-${to}: ${err.message || err}${retries < MAX_RETRIES ? ', retrying...' : ''}`);
+            
+            if (retries < MAX_RETRIES){
+              // Exponential backoff
+              const waitTime = Math.min(INITIAL_RETRY_DELAY * Math.pow(2, retries - 1), MAX_RETRY_DELAY);
+              await new Promise(r=>setTimeout(r, waitTime));
+              
+              // Reduce step size on repeated failures
+              if (retries === STEP_REDUCTION_THRESHOLD && step > MIN_STEP_SIZE) {
+                step = Math.max(MIN_STEP_SIZE, Math.floor(step/2));
+                appendLog(`reducing step size to ${step}`);
+              }
+            } else {
+              appendLog(`failed after ${MAX_RETRIES} retries, skipping range ${from}-${to}`);
+              success = true; // Move on to avoid infinite loop
+            }
+          }
         }
+        
+        // Small delay to avoid rate limiting
+        if (retriesCount > 2) await new Promise(r=>setTimeout(r, ADDITIONAL_RATE_LIMIT_DELAY));
       }
       setProgress(70);
+      etaEl.textContent = '';
       return logs;
     }
 
+    /**
+     * Attempts to decode a TransferSingle event log
+     * @param {ethers.Interface} iface - Contract interface
+     * @param {Object} log - Raw log object
+     * @returns {Object|null} Parsed log or null if decode fails
+     */
     function decodeTransferSingle(iface, log){
       try {
         return iface.parseLog(log);
       } catch { return null; }
     }
 
+    /**
+     * Attempts to decode a TransferBatch event log
+     * @param {ethers.Interface} iface - Contract interface
+     * @param {Object} log - Raw log object
+     * @returns {Object|null} Parsed log or null if decode fails
+     */
     function decodeTransferBatch(iface, log){
       try {
         return iface.parseLog(log);
       } catch { return null; }
     }
 
+    /**
+     * Processes transfer events to reconstruct token balances
+     * @param {Array} logs - Array of event logs
+     * @param {ethers.Interface} iface - Contract interface
+     * @param {string} tokenId - Token ID to track
+     * @returns {Array<{address: string, balance: string}>} Sorted array of holders with positive balances
+     */
     function processEventsToBalances(logs, iface, tokenId){
       const balances = new Map();
+      let processedEvents = 0;
+      
       for (const l of logs){
         const parsed = decodeTransferSingle(iface, l) || decodeTransferBatch(iface, l);
         if (!parsed) continue;
+        
+        processedEvents++;
         const name = parsed.name;
+        
         if (name === 'TransferSingle'){
           const from = parsed.args.from.toLowerCase();
           const to = parsed.args.to.toLowerCase();
@@ -225,6 +346,9 @@
           }
         }
       }
+      
+      appendLog(`processed ${processedEvents} relevant events from ${logs.length} total logs`);
+      
       const out = [];
       for (const [addr, balStr] of balances.entries()){
         const bal = BigInt(balStr);
@@ -234,10 +358,23 @@
       return out;
     }
 
+    /**
+     * Verifies reconstructed balances against on-chain state
+     * @async
+     * @param {ethers.Provider} provider - The RPC provider
+     * @param {string} contractAddress - Contract address
+     * @param {ethers.Interface} iface - Contract interface
+     * @param {Array<{address: string, balance: string}>} candidates - Candidate holders
+     * @param {string} tokenId - Token ID to verify
+     * @returns {Promise<Array<{address: string, balance: string}>>} Verified holders with actual balances
+     */
     async function verifyOnChain(provider, contractAddress, iface, candidates, tokenId){
       const out = [];
       appendLog(`verifying ${candidates.length} addresses on-chain`);
       let i = 0;
+      let failedCount = 0;
+      const startTime = Date.now();
+      
       for (const c of candidates){
         try {
           const data = iface.encodeFunctionData('balanceOf',[c.address, tokenId]);
@@ -245,29 +382,93 @@
           const decoded = iface.decodeFunctionResult('balanceOf', res)[0];
           const bal = BigInt(decoded.toString());
           if (bal > 0n) out.push({ address: c.address, balance: bal.toString() });
+          
+          // Small delay every N calls to avoid rate limiting
+          if (i > 0 && i % RATE_LIMIT_BATCH_SIZE === 0){
+            await new Promise(r=>setTimeout(r, RATE_LIMIT_DELAY));
+            
+            // Update ETA
+            const elapsed = Date.now() - startTime;
+            const progress = i / candidates.length;
+            const eta = Math.round((elapsed / progress - elapsed) / 1000);
+            etaEl.textContent = `ETA: ${eta}s`;
+          }
         } catch (err){
-          appendLog(`verify error ${c.address} ${err.message || err}`);
+          failedCount++;
+          appendLog(`verify error ${c.address}: ${err.message || err}`);
         }
         i++;
-        if (i % 10 === 0) setProgress(70 + Math.round((i / candidates.length) * 20));
+        setProgress(70 + Math.round((i / candidates.length) * 25));
       }
+      
+      if (failedCount > 0){
+        appendLog(`verification completed with ${failedCount} failures`);
+      }
+      
       out.sort((a,b)=> (BigInt(b.balance) > BigInt(a.balance) ? 1 : -1));
       setProgress(95);
+      etaEl.textContent = '';
       return out;
     }
 
     scanBtn.addEventListener('click', async ()=>{
+      // Prevent concurrent scans
+      if (isScanning){
+        appendLog('scan already in progress');
+        return;
+      }
+      
       const rpc = $('rpc').value.trim();
       const contractAddress = $('contract').value.trim();
       const tokenId = $('tokenId').value.toString();
       const startBlockInput = $('startBlock').value.trim();
 
-      if (!rpc || !contractAddress || !tokenId) { appendLog('missing input'); return; }
+      // Input validation
+      if (!rpc) {
+        appendLog('error: RPC URL is required');
+        statusEl.textContent = 'error: missing RPC URL';
+        return;
+      }
+      if (!isValidRpcUrl(rpc)) {
+        appendLog('error: invalid RPC URL format');
+        statusEl.textContent = 'error: invalid RPC URL';
+        return;
+      }
+      if (!contractAddress) {
+        appendLog('error: contract address is required');
+        statusEl.textContent = 'error: missing contract address';
+        return;
+      }
+      if (!isValidAddress(contractAddress)) {
+        appendLog('error: invalid contract address format');
+        statusEl.textContent = 'error: invalid contract address';
+        return;
+      }
+      if (!tokenId || tokenId === 'NaN') {
+        appendLog('error: token ID is required');
+        statusEl.textContent = 'error: missing token ID';
+        return;
+      }
+      
+      isScanning = true;
+      scanBtn.disabled = true;
+      scanBtn.textContent = 'Scanning...';
       contractDisplay.textContent = contractAddress;
       appendLog('creating provider');
       statusEl.textContent = 'initializing';
+      setProgress(0);
+      
       try{
         const provider = new ethers.JsonRpcProvider(rpc);
+        
+        // Test provider connection
+        try {
+          await provider.getBlockNumber();
+          appendLog('provider connection successful');
+        } catch (err) {
+          throw new Error(`failed to connect to RPC: ${err.message}`);
+        }
+        
         const iface = new ethers.Interface([
           "event TransferSingle(address indexed operator, address indexed from, address indexed to, uint256 id, uint256 value)",
           "event TransferBatch(address indexed operator, address indexed from, address indexed to, uint256[] ids, uint256[] values)",
@@ -279,24 +480,46 @@
         const latest = await provider.getBlockNumber();
 
         appendLog(`latest block ${latest}`);
+        appendLog(`scanning from block ${startBlock} to ${latest} (${latest - startBlock} blocks)`);
         statusEl.textContent = 'querying logs';
+        
         const logsSingle = await queryLogs(provider, contractAddress, [topicSingle], startBlock, latest, 50000);
         const logsBatch = await queryLogs(provider, contractAddress, [topicBatch], startBlock, latest, 50000);
+        
         appendLog(`logs fetched: single=${logsSingle.length} batch=${logsBatch.length}`);
         const allLogs = logsSingle.concat(logsBatch).sort((a,b)=> (a.blockNumber - b.blockNumber));
         appendLog(`total events ${allLogs.length}`);
-        statusEl.textContent = 'reconstructing';
-        reconHolders = processAndDisplay(allLogs, iface, tokenId);
-        setProgress(90);
-        statusEl.textContent = 'reconstruction complete';
-        tableFooter.textContent = `Reconstructed ${reconHolders.length} candidate holders (verify to confirm on-chain balances)`;
-        appendLog('reconstruction finished');
+        
+        if (allLogs.length === 0){
+          appendLog('warning: no transfer events found for this token');
+          statusEl.textContent = 'no events found';
+        } else {
+          statusEl.textContent = 'reconstructing';
+          reconHolders = processAndDisplay(allLogs, iface, tokenId);
+          setProgress(90);
+          statusEl.textContent = 'reconstruction complete';
+          tableFooter.textContent = `Reconstructed ${reconHolders.length} candidate holders (verify to confirm on-chain balances)`;
+          appendLog('reconstruction finished');
+        }
       } catch (err){
         appendLog('scan failed: ' + (err.message || err));
         statusEl.textContent = 'error';
+        tableFooter.textContent = 'Scan failed - check logs for details';
+      } finally {
+        isScanning = false;
+        scanBtn.disabled = false;
+        scanBtn.textContent = 'Scan and Reconstruct';
+        setProgress(0);
       }
     });
 
+    /**
+     * Processes logs and displays results in the table
+     * @param {Array} allLogs - All event logs
+     * @param {ethers.Interface} iface - Contract interface
+     * @param {string} tokenId - Token ID
+     * @returns {Array<{address: string, balance: string}>} Holder data
+     */
     function processAndDisplay(allLogs, iface, tokenId){
       const parsed = allLogs.map(l=>{
         try { return iface.parseLog(l); } catch { return null; }
@@ -304,31 +527,62 @@
       // Because parseLog returns same shape for both TransferSingle and TransferBatch we can reuse
       const holders = processEventsToBalances(allLogs, iface, tokenId);
       tableBody.innerHTML = '';
-      for (const h of holders.slice(0,2000)){
+      const displayHolders = holders.slice(0, DISPLAY_LIMIT);
+      
+      for (const h of displayHolders){
         const tr = document.createElement('tr');
         const a = document.createElement('td'); a.textContent = h.address;
         const b = document.createElement('td'); b.textContent = h.balance;
         tr.appendChild(a); tr.appendChild(b);
         tableBody.appendChild(tr);
       }
+      
       countEl.textContent = holders.length.toString();
+      
+      if (holders.length > DISPLAY_LIMIT){
+        appendLog(`displaying first ${DISPLAY_LIMIT} of ${holders.length} holders`);
+      }
+      
       return holders;
     }
 
     fetchHoldersBtn.addEventListener('click', async ()=>{
-      if (!reconHolders || reconHolders.length === 0){ appendLog('no candidates to verify'); return; }
+      if (!reconHolders || reconHolders.length === 0){
+        appendLog('error: no candidates to verify - run scan first');
+        statusEl.textContent = 'error: no data';
+        return;
+      }
+      
       const rpc = $('rpc').value.trim();
       const contractAddress = $('contract').value.trim();
       const tokenId = $('tokenId').value.toString();
-      const provider = new ethers.JsonRpcProvider(rpc);
-      const iface = new ethers.Interface([
-        "function balanceOf(address account, uint256 id) view returns (uint256)"
-      ]);
+      
+      // Input validation
+      if (!isValidRpcUrl(rpc)){
+        appendLog('error: invalid RPC URL');
+        return;
+      }
+      if (!isValidAddress(contractAddress)){
+        appendLog('error: invalid contract address');
+        return;
+      }
+      
+      fetchHoldersBtn.disabled = true;
+      fetchHoldersBtn.textContent = 'Verifying...';
+      
       try {
+        const provider = new ethers.JsonRpcProvider(rpc);
+        const iface = new ethers.Interface([
+          "function balanceOf(address account, uint256 id) view returns (uint256)"
+        ]);
+        
         statusEl.textContent = 'verifying on-chain';
+        appendLog(`starting verification of ${reconHolders.length} addresses`);
+        
         const verified = await verifyOnChain(provider, contractAddress, iface, reconHolders, tokenId);
         reconHolders = verified;
         tableBody.innerHTML = '';
+        
         for (const h of verified){
           const tr = document.createElement('tr');
           const a = document.createElement('td'); a.textContent = h.address;
@@ -336,57 +590,94 @@
           tr.appendChild(a); tr.appendChild(b);
           tableBody.appendChild(tr);
         }
+        
         countEl.textContent = verified.length.toString();
         tableFooter.textContent = `Verified ${verified.length} on-chain holders`;
-        appendLog(`verification complete: ${verified.length} holders`);
+        appendLog(`verification complete: ${verified.length} holders confirmed`);
         setProgress(100);
         statusEl.textContent = 'done';
       } catch (err){
         appendLog('verify failed: ' + (err.message || err));
         statusEl.textContent = 'error';
+        tableFooter.textContent = 'Verification failed - check logs';
+      } finally {
+        fetchHoldersBtn.disabled = false;
+        fetchHoldersBtn.textContent = 'Fetch Verified Holders';
       }
     });
 
     downloadBtn.addEventListener('click', ()=>{
-      if (!reconHolders || reconHolders.length === 0){ appendLog('no data to download'); return; }
-      const csv = toCSV(reconHolders);
-      const blob = new Blob([csv], { type: 'text/csv' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      const tokenId = $('tokenId').value.toString().replace(/[^\d]/g,'') || 'token';
-      a.href = url;
-      a.download = `holders_token_${tokenId}.csv`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
-      appendLog('CSV download initiated');
+      if (!reconHolders || reconHolders.length === 0){
+        appendLog('error: no data to download');
+        statusEl.textContent = 'error: no data';
+        return;
+      }
+      
+      try {
+        const csv = toCSV(reconHolders);
+        const blob = new Blob([csv], { type: 'text/csv' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        const tokenId = $('tokenId').value.toString().replace(/[^\d]/g,'') || 'token';
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19); // YYYY-MM-DDTHH-MM-SS
+        a.href = url;
+        a.download = `holders_token_${tokenId}_${timestamp}.csv`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+        appendLog(`CSV download initiated: ${reconHolders.length} holders`);
+      } catch (err) {
+        appendLog(`download failed: ${err.message || err}`);
+        statusEl.textContent = 'error';
+      }
     });
 
-    // small helper to attempt an automatic start-block guess by reading contract creation logs via provider.getLogs for the address
+    // Auto-suggest start block based on contract deployment
     (async function trySuggestStart(){
       try {
         const rpc = $('rpc').value.trim();
+        if (!isValidRpcUrl(rpc)) return;
+        
         const provider = new ethers.JsonRpcProvider(rpc);
         const address = $('contract').value.trim();
-        if (!address) return;
+        if (!address || !isValidAddress(address)) return;
+        
+        appendLog('attempting to detect contract deployment block...');
         const latest = await provider.getBlockNumber();
-        const now = latest;
-        // rough binary search for first non-zero logs presence for address (best-effort)
-        let low = now - 8000000; if (low < 0) low = 0;
-        let high = now;
+        
+        // Binary search for first non-zero logs presence for address
+        let low = Math.max(0, latest - MAX_BLOCK_SEARCH_RANGE);
+        let high = latest;
         let foundBlock = null;
-        for (let i=0;i<6;i++){
+        
+        for (let i=0; i<6; i++){
           const mid = Math.floor((low+high)/2);
           try {
             const logs = await provider.getLogs({address, fromBlock: mid, toBlock: high, limit: 1});
-            if (logs.length>0){ foundBlock = logs[0].blockNumber; high = mid; }
-            else { low = Math.max(0, mid+1); }
+            if (logs.length > 0){
+              foundBlock = logs[0].blockNumber;
+              high = mid;
+            } else {
+              low = Math.max(0, mid+1);
+            }
             if (high - low < 2000) break;
-          } catch { break; }
+          } catch (err) {
+            appendLog(`start block detection failed: ${err.message || err}`);
+            break;
+          }
         }
-        if (foundBlock) { $('startBlock').value = Math.max(0, foundBlock - 20); appendLog('suggested start block ' + $('startBlock').value); }
-      } catch {}
+        
+        if (foundBlock){
+          const suggestedBlock = Math.max(0, foundBlock - 20);
+          $('startBlock').value = suggestedBlock;
+          appendLog(`suggested start block: ${suggestedBlock} (contract activity detected at ${foundBlock})`);
+        } else {
+          appendLog('could not detect contract deployment block automatically');
+        }
+      } catch (err) {
+        appendLog(`start block detection error: ${err.message || err}`);
+      }
     })();
 
   </script>
